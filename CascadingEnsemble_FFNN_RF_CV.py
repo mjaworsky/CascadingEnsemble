@@ -1,373 +1,513 @@
 # ============================================================
-# Cascade threshold tuning (NO SMOTE, NO KFold)
-# Gate trained on BALANCED subset (downsample majority in TRAIN)
-# Minority stage = RandomForestClassifier
+# Cascade WITH CV (RF version) + Minority macro-F1 metric (selected minority labels)
 #
-# Goal: prevent gate collapsing to "always majority" which causes
-#       predicted minority rate = 0% even when T_GATE is tiny.
+# Adds:
+#   minority_macro_f1 = safe_macro_f1_on_labels(y_true, y_pred, labels=topk_minority)
+# and prints it for:
+#   - Minority RF pooled OOF (minority-only stage)
+#   - Full Cascade pooled OOF (all samples)
+#
+# Notes:
+# - "TEST" in your earlier printouts = the held-out set.
+#   Here we’re doing OOF across CV, so it’s "OOF".
+#   (Same idea: unbiased predictions for every sample.)
 # ============================================================
 
-import os, json
+import os
 import numpy as np
 import pandas as pd
 
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import KFold, RepeatedStratifiedKFold
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import classification_report, f1_score
+from sklearn.utils.class_weight import compute_class_weight
+from sklearn.metrics import (
+    classification_report,
+    precision_recall_fscore_support,
+    accuracy_score,
+    balanced_accuracy_score,
+    f1_score,
+)
 from sklearn.ensemble import RandomForestClassifier
 
-from tensorflow.keras.models import Sequential
+import tensorflow as tf
+from tensorflow.keras import Sequential
 from tensorflow.keras.layers import Dense, Dropout, Input
 from tensorflow.keras.callbacks import EarlyStopping
 from tensorflow.keras.optimizers import Adam
 
-try:
-    from google.colab import drive
-    IN_COLAB = True
-except Exception:
-    IN_COLAB = False
+# -----------------------------
+# Repro
+# -----------------------------
+SEED = 42
+np.random.seed(SEED)
+tf.random.set_seed(SEED)
 
+# -----------------------------
+# User settings
+# -----------------------------
+TOP_K_MINORITY = 20
 
-# ----------------------------
-# Config
-# ----------------------------
-RANDOM_STATE = 42
-rng = np.random.default_rng(RANDOM_STATE)
+# Gate NN hyperparams
+GATE_EPOCHS = 50
+GATE_BATCH = 256
+GATE_LR = 1e-3
+GATE_PATIENCE = 6
 
-# Threshold grids
-T_GATE_GRID   = np.round(np.linspace(0.001, 0.20, 60), 4)
-T_ACCEPT_GRID = np.round(np.linspace(0.00, 0.50, 51), 4)
-
-# Minority RF config
-RF_N_ESTIMATORS = 600
-RF_MIN_SAMPLES_LEAF = 2
+# Random Forest hyperparams (tweak as you like)
+RF_N_ESTIMATORS = 400
 RF_MAX_DEPTH = None
+RF_MIN_SAMPLES_LEAF = 1
+RF_MIN_SAMPLES_SPLIT = 2
+RF_MAX_FEATURES = "sqrt"
 RF_N_JOBS = -1
 
-# Gate NN config
-GATE_EPOCHS = 40
-GATE_BATCH = 512
-GATE_LR = 1e-3
-GATE_PATIENCE = 5
+# Fixed thresholds (NO tuning)
+GATE_THRESHOLD = 0.50          # route to minority RF if P(minority) >= this
+MIN_ACCEPT_THRESHOLD = 0.00    # accept RF prediction if RF max-proba >= this (0 = always accept)
 
-# Output (optional)
-SAVE_TO_DRIVE = IN_COLAB
-OUTPUT_DIR = "/content/drive/My Drive/ColabOutputs/Cascade_ThresholdTuning_RF"
-REPORT_NAME = "cascade_threshold_tuning_report.txt"
-THRESH_NAME = "best_thresholds.json"
+# CV settings
+GATE_FOLDS = 5
 
-
-# ----------------------------
-# Utilities
-# ----------------------------
-def safe_f1_macro_minority(y_true, y_pred, minority_labels):
-    return f1_score(
-        y_true, y_pred,
-        labels=minority_labels,
-        average="macro",
-        zero_division=0
-    )
-
-def gate_binary_labels(y, majority_label):
-    return (y != majority_label).astype(int)
-
-def summarize_probs(name, p):
-    p = np.asarray(p).reshape(-1)
-    qs = np.quantile(p, [0.0, 0.01, 0.05, 0.10, 0.50, 0.90, 0.95, 0.99, 1.0])
-    print(f"\n{name} prob summary:")
-    print("  min  :", float(qs[0]))
-    print("  p01  :", float(qs[1]))
-    print("  p05  :", float(qs[2]))
-    print("  p10  :", float(qs[3]))
-    print("  p50  :", float(qs[4]))
-    print("  p90  :", float(qs[5]))
-    print("  p95  :", float(qs[6]))
-    print("  p99  :", float(qs[7]))
-    print("  max  :", float(qs[8]))
-
-def train_gate_nn_balanced(X_train_s, y_train_bin, X_val_s, y_val_bin, majority_downsample_ratio=1.0):
-    """
-    Train gate on a BALANCED subset:
-      - keep ALL minority samples
-      - randomly sample majority to match minority count * ratio
-    """
-    idx_min = np.where(y_train_bin == 1)[0]
-    idx_maj = np.where(y_train_bin == 0)[0]
-
-    if idx_min.size == 0:
-        raise ValueError("Gate TRAIN has 0 minority samples. Can't train a gate.")
-    if idx_maj.size == 0:
-        raise ValueError("Gate TRAIN has 0 majority samples. Weird.")
-
-    n_min = idx_min.size
-    n_maj_keep = int(n_min * majority_downsample_ratio)
-    n_maj_keep = max(1, min(n_maj_keep, idx_maj.size))
-
-    maj_sample = rng.choice(idx_maj, size=n_maj_keep, replace=False)
-    idx_bal = np.concatenate([idx_min, maj_sample])
-    rng.shuffle(idx_bal)
-
-    Xb = X_train_s[idx_bal]
-    yb = y_train_bin[idx_bal]
-
-    print("\n========== Gate balanced training set ==========")
-    print("Original gate TRAIN size:", len(y_train_bin),
-          "  minority:", int((y_train_bin==1).sum()),
-          "  majority:", int((y_train_bin==0).sum()))
-    print("Balanced gate TRAIN size:", len(yb),
-          "  minority:", int((yb==1).sum()),
-          "  majority:", int((yb==0).sum()))
-
-    model = Sequential([
-        Input(shape=(X_train_s.shape[1],)),
-        Dense(256, activation="relu"),
-        Dropout(0.15),
-        Dense(128, activation="relu"),
-        Dropout(0.15),
-        Dense(1, activation="sigmoid")
-    ])
-    model.compile(
-        optimizer=Adam(learning_rate=GATE_LR),
-        loss="binary_crossentropy",
-        metrics=[]
-    )
-
-    es = EarlyStopping(
-        monitor="val_loss",
-        patience=GATE_PATIENCE,
-        restore_best_weights=True
-    )
-
-    model.fit(
-        Xb, yb,
-        validation_data=(X_val_s, y_val_bin),
-        epochs=GATE_EPOCHS,
-        batch_size=GATE_BATCH,
-        callbacks=[es],
-        verbose=1
-    )
-    return model
-
-def train_minority_model_rf(X_min_train, y_min_train):
-    clf = RandomForestClassifier(
-        n_estimators=RF_N_ESTIMATORS,
-        min_samples_leaf=RF_MIN_SAMPLES_LEAF,
-        max_depth=RF_MAX_DEPTH,
-        class_weight="balanced_subsample",
-        n_jobs=RF_N_JOBS,
-        random_state=RANDOM_STATE
-    )
-    clf.fit(X_min_train, y_min_train)
-    return clf
-
-def run_cascade_predict(y_majority_label, gate_probs, minority_clf, X, T_GATE, T_ACCEPT, minority_labels):
-    n = X.shape[0]
-    y_pred = np.full(n, y_majority_label, dtype=int)
-
-    idx = np.where(gate_probs >= T_GATE)[0]
-    if idx.size == 0:
-        return y_pred
-
-    X_sub = X[idx]
-
-    # accept threshold logic needs proba; RF has it.
-    proba = minority_clf.predict_proba(X_sub)
-    pmax = proba.max(axis=1)
-    y_sub = minority_clf.classes_[proba.argmax(axis=1)]
-
-    accept = (pmax >= T_ACCEPT) & np.isin(y_sub, minority_labels)
-    y_pred[idx[accept]] = y_sub[accept]
-    return y_pred
-
+RF_RS_FOLDS = 3
+RF_RS_REPEATS = 5  # set higher for stabler averages
 
 # -----------------------------
 # Load data
 # -----------------------------
-CSV_PATH = "/content/LLCP_SMOKE_5YEAR.csv"
+CSV_PATH = "/content/LLCP2017_2018_2019_2020_2021XPT_LINEAR_WHOICD_5YEAR.csv"
+
 if not os.path.exists(CSV_PATH):
-    raise FileNotFoundError(f"CSV_PATH not found: {CSV_PATH}")
+    raise FileNotFoundError(
+        f"CSV_PATH not found: {CSV_PATH}\n"
+        "Fix CSV_PATH to point to your already-uploaded file."
+    )
 
 df = pd.read_csv(CSV_PATH)
 print(f"Loaded: {CSV_PATH}")
 print("Shape:", df.shape)
 
-if "CNCRTYP1" not in df.columns:
-    raise ValueError("Expected column CNCRTYP1 in the CSV.")
+# -----------------------------
+# Basic cleaning / target handling
+# -----------------------------
+TARGET_COL = "CNCRTYP1"
+DROP_COLS = ["CNCRTYP1", "CNCRAGE"]  # keep CNCRAGE out of features
 
-# ----------------------------
-# Select classes (majority + top-20 minorities)
-# ----------------------------
-class_counts = df["CNCRTYP1"].value_counts()
+if TARGET_COL not in df.columns:
+    raise ValueError(f"Expected column '{TARGET_COL}' not found in CSV.")
+
+df = df.copy()
+
+# Filter invalid CNCRTYP1 codes if present
+df = df[~df[TARGET_COL].isin([77, 99])].copy()
+
+# Coerce target to int safely
+df[TARGET_COL] = pd.to_numeric(df[TARGET_COL], errors="coerce")
+df = df.dropna(subset=[TARGET_COL]).copy()
+df[TARGET_COL] = df[TARGET_COL].astype(int)
+
+# Replace inf, keep NaNs -> fill 0
+df.replace([np.inf, -np.inf], np.nan, inplace=True)
+df.fillna(0, inplace=True)
+
+# -----------------------------
+# Select majority + TOP_K minority classes
+# -----------------------------
+class_counts = df[TARGET_COL].value_counts()
 majority_class = int(class_counts.idxmax())
-
-minority_candidates = class_counts[class_counts.index != majority_class]
-topk_minority = [int(x) for x in minority_candidates.head(20).index.tolist()]
-
-selected_classes = [majority_class] + topk_minority
-df = df[df["CNCRTYP1"].isin(selected_classes)].copy()
 
 print("\n========== Select Classes ==========")
 print("Majority class:", majority_class)
+
+minority_candidates = class_counts[class_counts.index != majority_class]
+topk_minority = [int(x) for x in minority_candidates.head(TOP_K_MINORITY).index.tolist()]
+
+selected_classes = [majority_class] + topk_minority
+df = df[df[TARGET_COL].isin(selected_classes)].copy()
+
 print("Selected minority labels:", topk_minority)
 print("\nClass distribution (selected):")
-print(df["CNCRTYP1"].value_counts())
+print(df[TARGET_COL].value_counts())
 
-if len(topk_minority) == 0:
-    raise ValueError("No minority labels selected. CNCRTYP1 seems to contain only the majority class in this file.")
-
-# ----------------------------
-# Build features
-# ----------------------------
-y = df["CNCRTYP1"].astype(int).values
-
-drop_cols = ["CNCRTYP1"]
-if "CNCRAGE" in df.columns:
-    drop_cols.append("CNCRAGE")
-
-X_df = df.drop(columns=drop_cols)
-X_df = X_df.select_dtypes(include=[np.number]).copy()
-X = X_df.values.astype(np.float32)
-
+# -----------------------------
+# Build X / y / y_gate
+# -----------------------------
 print("\n========== Build Features ==========")
-print("X shape:", X.shape, "y shape:", y.shape)
+X = df.drop(columns=[c for c in DROP_COLS if c in df.columns], errors="ignore").values.astype(np.float32)
+y = df[TARGET_COL].values.astype(int)
 
-# ----------------------------
-# Split (stratified)
-# ----------------------------
-X_trainval, X_test, y_trainval, y_test = train_test_split(
-    X, y, test_size=0.2, random_state=RANDOM_STATE, stratify=y
+# Gate labels: 0 = majority, 1 = minority
+y_gate = (y != majority_class).astype(int)
+
+print("X shape:", X.shape)
+print("y shape:", y.shape)
+print("Gate minority rate:", y_gate.mean())
+
+# -----------------------------
+# Helpers
+# -----------------------------
+def build_gate_model(input_dim: int) -> tf.keras.Model:
+    model = Sequential([
+        Input(shape=(input_dim,)),
+        Dense(256, activation="relu"),
+        Dropout(0.15),
+        Dense(128, activation="relu"),
+        Dropout(0.15),
+        Dense(64, activation="relu"),
+        Dense(1, activation="sigmoid"),
+    ])
+    model.compile(
+        optimizer=Adam(learning_rate=GATE_LR),
+        loss="binary_crossentropy",
+        metrics=["accuracy"]
+    )
+    return model
+
+def make_rf() -> RandomForestClassifier:
+    return RandomForestClassifier(
+        n_estimators=RF_N_ESTIMATORS,
+        random_state=SEED,
+        n_jobs=RF_N_JOBS,
+        max_depth=RF_MAX_DEPTH,
+        min_samples_leaf=RF_MIN_SAMPLES_LEAF,
+        min_samples_split=RF_MIN_SAMPLES_SPLIT,
+        max_features=RF_MAX_FEATURES,
+        class_weight="balanced_subsample",
+    )
+
+def summarize_binary_metrics(y_true, y_pred):
+    acc = accuracy_score(y_true, y_pred)
+    bacc = balanced_accuracy_score(y_true, y_pred)
+    p, r, f1, _ = precision_recall_fscore_support(
+        y_true, y_pred, average="binary", zero_division=0
+    )
+    return {"acc": acc, "bal_acc": bacc, "prec": p, "rec": r, "f1": f1}
+
+def summarize_multiclass_metrics(y_true, y_pred):
+    acc = accuracy_score(y_true, y_pred)
+    bacc = balanced_accuracy_score(y_true, y_pred)
+    f1_macro = f1_score(y_true, y_pred, average="macro", zero_division=0)
+    f1_weighted = f1_score(y_true, y_pred, average="weighted", zero_division=0)
+    return {"acc": acc, "bal_acc": bacc, "f1_macro": f1_macro, "f1_weighted": f1_weighted}
+
+def mean_std(metrics_list, key):
+    vals = np.array([m[key] for m in metrics_list], dtype=float)
+    return vals.mean(), vals.std(ddof=1) if len(vals) > 1 else 0.0
+
+def print_mean_std(metrics_list, keys, title):
+    print(f"\n{title}")
+    for k in keys:
+        mu, sd = mean_std(metrics_list, k)
+        print(f"  {k:>10s}: {mu:.4f} ± {sd:.4f}")
+
+def safe_macro_f1_on_labels(y_true, y_pred, labels):
+    """
+    Macro-F1 computed ONLY over the provided labels.
+    - If a label has 0 support in y_true, sklearn can behave oddly for per-label
+      averages; we explicitly filter to labels that appear in y_true.
+    - If none appear, return 0.0.
+    """
+    labels = [int(l) for l in labels]
+    present = sorted(set(int(x) for x in np.unique(y_true)).intersection(labels))
+    if len(present) == 0:
+        return 0.0
+    return float(f1_score(y_true, y_pred, labels=present, average="macro", zero_division=0))
+
+def cascade_predict_from_probs(
+    y_true: np.ndarray,
+    gate_probs: np.ndarray,
+    minor_classes: np.ndarray,
+    minor_proba: np.ndarray,
+    majority_class: int,
+    gate_t: float,
+    accept_t: float
+) -> np.ndarray:
+    y_pred = np.full(shape=(len(y_true),), fill_value=majority_class, dtype=int)
+
+    route_min = (gate_probs >= gate_t)
+    idx = np.where(route_min)[0]
+    if len(idx) == 0:
+        return y_pred
+
+    probs = minor_proba[idx]
+    maxp = probs.max(axis=1)
+    pred_class = minor_classes[np.argmax(probs, axis=1)]
+
+    accept = (maxp >= accept_t)
+    y_pred[idx[accept]] = pred_class[accept]
+    return y_pred
+
+# ============================================================
+# (1) Gate NN: 5-fold NON-STRATIFIED CV
+# ============================================================
+print("\n============================================================")
+print("========== (1) Gate NN: 5-FOLD NON-STRATIFIED CV ==========")
+print("============================================================")
+
+kf_gate = KFold(n_splits=GATE_FOLDS, shuffle=True, random_state=SEED)
+
+oof_gate_probs = np.zeros(len(y), dtype=float)
+oof_gate_pred  = np.zeros(len(y), dtype=int)
+
+gate_fold_metrics = []
+
+for fold, (tr_idx, va_idx) in enumerate(kf_gate.split(X), start=1):
+    print(f"\n--- Gate Fold {fold}/{GATE_FOLDS} ---")
+
+    X_tr, X_va = X[tr_idx], X[va_idx]
+    yg_tr, yg_va = y_gate[tr_idx], y_gate[va_idx]
+
+    scaler = StandardScaler()
+    X_tr_s = scaler.fit_transform(X_tr)
+    X_va_s = scaler.transform(X_va)
+
+    gate_classes = np.unique(yg_tr)
+    gate_cw = compute_class_weight(class_weight="balanced", classes=gate_classes, y=yg_tr)
+    gate_cw_dict = {int(c): float(w) for c, w in zip(gate_classes, gate_cw)}
+
+    gate = build_gate_model(input_dim=X_tr_s.shape[1])
+    early = EarlyStopping(monitor="val_loss", patience=GATE_PATIENCE, restore_best_weights=True)
+
+    gate.fit(
+        X_tr_s, yg_tr,
+        validation_split=0.2,
+        epochs=GATE_EPOCHS,
+        batch_size=GATE_BATCH,
+        class_weight=gate_cw_dict,
+        callbacks=[early],
+        verbose=0
+    )
+
+    probs = gate.predict(X_va_s, verbose=0).ravel()
+    pred  = (probs >= GATE_THRESHOLD).astype(int)
+
+    oof_gate_probs[va_idx] = probs
+    oof_gate_pred[va_idx]  = pred
+
+    m = summarize_binary_metrics(yg_va, pred)
+    gate_fold_metrics.append(m)
+    print("Fold metrics:", {k: round(v, 4) for k, v in m.items()})
+    print("Fold minority rate (VAL):", round(float(yg_va.mean()), 6))
+
+print_mean_std(
+    gate_fold_metrics,
+    keys=["acc", "bal_acc", "prec", "rec", "f1"],
+    title="Gate NN: mean ± std across 5 folds (minority=1 positive class)"
 )
-X_train, X_val, y_train, y_val = train_test_split(
-    X_trainval, y_trainval, test_size=0.2, random_state=RANDOM_STATE, stratify=y_trainval
+
+print("\n========== Gate NN POOLED OOF Report (all folds combined) ==========")
+print("Gate threshold:", GATE_THRESHOLD)
+print(classification_report(y_gate, oof_gate_pred, zero_division=0))
+
+# ============================================================
+# (2) Minority RF: RepeatedStratified 3-fold CV
+# ============================================================
+print("\n============================================================")
+print("========== (2) Minority RF: RepeatedStratified 3-FOLD CV (Averaged) ==========")
+print("============================================================")
+
+minor_mask = (y != majority_class)
+X_min = X[minor_mask]
+y_min = y[minor_mask]
+
+minority_labels = sorted(np.unique(y_min).tolist())
+lab_to_idx = {lab: i for i, lab in enumerate(minority_labels)}
+
+print("Minority sample count:", len(y_min))
+print("Minority label count :", len(minority_labels))
+
+rskf_rf = RepeatedStratifiedKFold(
+    n_splits=RF_RS_FOLDS,
+    n_repeats=RF_RS_REPEATS,
+    random_state=SEED
 )
 
-print("\n========== Split ==========")
-print("Shapes:", X_train.shape, X_val.shape, X_test.shape)
+proba_sum = np.zeros((len(y_min), len(minority_labels)), dtype=np.float64)
+proba_cnt = np.zeros(len(y_min), dtype=np.int32)
 
-# ----------------------------
-# Scale
-# ----------------------------
-scaler = StandardScaler()
-X_train_s = scaler.fit_transform(X_train)
-X_val_s = scaler.transform(X_val)
-X_test_s = scaler.transform(X_test)
+rf_split_metrics = []
+total_splits = RF_RS_FOLDS * RF_RS_REPEATS
 
-# ----------------------------
-# Train Gate on BALANCED TRAIN subset
-# ----------------------------
-y_train_bin = gate_binary_labels(y_train, majority_class)
-y_val_bin   = gate_binary_labels(y_val, majority_class)
+for split_i, (tr_idx, va_idx) in enumerate(rskf_rf.split(X_min, y_min), start=1):
+    X_tr, X_va = X_min[tr_idx], X_min[va_idx]
+    y_tr, y_va = y_min[tr_idx], y_min[va_idx]
 
-print("\n========== Train Gate NN (balanced TRAIN) ==========")
-gate_model = train_gate_nn_balanced(X_train_s, y_train_bin, X_val_s, y_val_bin, majority_downsample_ratio=1.0)
+    scaler = StandardScaler()
+    X_tr_s = scaler.fit_transform(X_tr)
+    X_va_s = scaler.transform(X_va)
 
-gate_val_prob  = gate_model.predict(X_val_s, verbose=0).reshape(-1)
-gate_test_prob = gate_model.predict(X_test_s, verbose=0).reshape(-1)
+    rf = make_rf()
+    rf.fit(X_tr_s, y_tr)
 
-summarize_probs("Gate VAL", gate_val_prob)
-summarize_probs("Gate TEST", gate_test_prob)
+    rf_classes = rf.classes_
+    rf_proba = rf.predict_proba(X_va_s)
 
-print("\n========== Gate send-rate diagnostics (VAL) ==========")
-for tg in [0.001, 0.005, 0.01, 0.02, 0.05, 0.10, 0.20]:
-    print(f"T_GATE={tg:>6} -> sent: {float((gate_val_prob >= tg).mean())*100:6.2f}%")
+    mapped = np.zeros((len(va_idx), len(minority_labels)), dtype=np.float64)
+    for j, c in enumerate(rf_classes):
+        mapped[:, lab_to_idx[int(c)]] = rf_proba[:, j]
 
-# ----------------------------
-# Train Minority RF on TRUE minority TRAIN ONLY
-# ----------------------------
-minority_labels = np.array(topk_minority, dtype=int)
+    proba_sum[va_idx] += mapped
+    proba_cnt[va_idx] += 1
 
-is_min_train = (y_train != majority_class)
-X_min_train = X_train_s[is_min_train]
-y_min_train = y_train[is_min_train]
+    pred = rf_classes[np.argmax(rf_proba, axis=1)]
+    m = summarize_multiclass_metrics(y_va, pred)
+    rf_split_metrics.append(m)
 
-print("\n========== Train Minority Model (RF; true minority train only) ==========")
-print("Minority train samples:", X_min_train.shape[0])
-print("Minority labels in TRAIN:", sorted(np.unique(y_min_train).tolist()))
+    if split_i % RF_RS_FOLDS == 0 or split_i == total_splits:
+        print(f"Completed {split_i}/{total_splits} splits")
 
-minority_model = train_minority_model_rf(X_min_train, y_min_train)
+print_mean_std(
+    rf_split_metrics,
+    keys=["acc", "bal_acc", "f1_macro", "f1_weighted"],
+    title=f"Minority RF: mean ± std across {total_splits} splits (repeated {RF_RS_FOLDS}-fold)"
+)
 
-# ----------------------------
-# Threshold tuning on VAL
-# ----------------------------
-print("\n========== Threshold Tuning on VAL (objective = minority-macro-F1) ==========")
+avg_proba = proba_sum / np.maximum(proba_cnt[:, None], 1)
+oof_rf_pred_min = np.array(minority_labels, dtype=int)[np.argmax(avg_proba, axis=1)]
 
-best = {"score": -1.0, "T_GATE": None, "T_MINOR_ACCEPT": None}
+print("\n========== Minority RF POOLED OOF Report (probability-averaged) ==========")
+print(classification_report(y_min, oof_rf_pred_min, zero_division=0))
 
-min_val_proba_full = minority_model.predict_proba(X_val_s)
-min_val_classes = minority_model.classes_
+# ---- ADD YOUR METRIC HERE (minority macro-F1 over SELECTED minority labels) ----
+minority_macro_f1_minority_stage = safe_macro_f1_on_labels(
+    y_true=y_min,
+    y_pred=oof_rf_pred_min,
+    labels=topk_minority
+)
+print("\nMinority macro-F1 on OOF (minority RF stage, over selected minority labels):",
+      minority_macro_f1_minority_stage)
 
-for T_GATE in T_GATE_GRID:
-    gate_idx = np.where(gate_val_prob >= T_GATE)[0]
+# ============================================================
+# (3) BONUS: Full cascade OOF using SAME 5 gate folds (non-stratified)
+# ============================================================
+print("\n============================================================")
+print("========== (3) BONUS: Full Cascade OOF (5 folds, averaged) ==========")
+print("============================================================")
 
-    if gate_idx.size == 0:
-        # everything majority
-        y_val_pred = np.full_like(y_val, majority_class)
-        score = safe_f1_macro_minority(y_val, y_val_pred, minority_labels)
-        if score > best["score"]:
-            best.update(score=float(score), T_GATE=float(T_GATE), T_MINOR_ACCEPT=float(T_ACCEPT_GRID[0]))
+oof_cascade_pred = np.full(len(y), majority_class, dtype=int)
+cascade_fold_metrics = []
+
+for fold, (tr_idx, va_idx) in enumerate(kf_gate.split(X), start=1):
+    print(f"\n--- Cascade Fold {fold}/{GATE_FOLDS} ---")
+
+    X_tr, X_va = X[tr_idx], X[va_idx]
+    y_tr, y_va = y[tr_idx], y[va_idx]
+    yg_tr, yg_va = y_gate[tr_idx], y_gate[va_idx]
+
+    scaler = StandardScaler()
+    X_tr_s = scaler.fit_transform(X_tr)
+    X_va_s = scaler.transform(X_va)
+
+    # ---- Train Gate ----
+    gate_classes = np.unique(yg_tr)
+    gate_cw = compute_class_weight(class_weight="balanced", classes=gate_classes, y=yg_tr)
+    gate_cw_dict = {int(c): float(w) for c, w in zip(gate_classes, gate_cw)}
+
+    gate = build_gate_model(input_dim=X_tr_s.shape[1])
+    early = EarlyStopping(monitor="val_loss", patience=GATE_PATIENCE, restore_best_weights=True)
+
+    gate.fit(
+        X_tr_s, yg_tr,
+        validation_split=0.2,
+        epochs=GATE_EPOCHS,
+        batch_size=GATE_BATCH,
+        class_weight=gate_cw_dict,
+        callbacks=[early],
+        verbose=0
+    )
+
+    va_gate_probs = gate.predict(X_va_s, verbose=0).ravel()
+
+    # ---- Train RF on TRUE minority TRAIN samples only ----
+    min_tr_mask = (y_tr != majority_class)
+    X_tr_min_s = X_tr_s[min_tr_mask]
+    y_tr_min   = y_tr[min_tr_mask]
+
+    if len(np.unique(y_tr_min)) < 2:
+        print("WARNING: Not enough minority variety in this fold. Defaulting to majority.")
+        va_pred = np.full(len(y_va), majority_class, dtype=int)
+        oof_cascade_pred[va_idx] = va_pred
+        cascade_fold_metrics.append(summarize_multiclass_metrics(y_va, va_pred))
         continue
 
-    proba_sub = min_val_proba_full[gate_idx]
-    pmax_sub = proba_sub.max(axis=1)
-    yhat_sub = min_val_classes[proba_sub.argmax(axis=1)]
+    rf = make_rf()
+    rf.fit(X_tr_min_s, y_tr_min)
 
-    for T_ACC in T_ACCEPT_GRID:
-        y_val_pred = np.full_like(y_val, majority_class)
-        accept = (pmax_sub >= T_ACC) & np.isin(yhat_sub, minority_labels)
-        y_val_pred[gate_idx[accept]] = yhat_sub[accept]
+    rf_classes = rf.classes_
+    rf_proba_va = rf.predict_proba(X_va_s)
 
-        score = safe_f1_macro_minority(y_val, y_val_pred, minority_labels)
-        if score > best["score"]:
-            best.update(score=float(score), T_GATE=float(T_GATE), T_MINOR_ACCEPT=float(T_ACC))
+    va_pred = cascade_predict_from_probs(
+        y_true=y_va,
+        gate_probs=va_gate_probs,
+        minor_classes=rf_classes,
+        minor_proba=rf_proba_va,
+        majority_class=majority_class,
+        gate_t=GATE_THRESHOLD,
+        accept_t=MIN_ACCEPT_THRESHOLD
+    )
 
-print("Best VAL minority-macro-F1:", best["score"])
-print("Best thresholds: T_GATE =", best["T_GATE"], ", T_MINOR_ACCEPT =", best["T_MINOR_ACCEPT"])
+    oof_cascade_pred[va_idx] = va_pred
 
-# ----------------------------
-# Evaluate on TEST
-# ----------------------------
-print("\n========== Final Cascade (TEST) ==========")
-T_GATE = best["T_GATE"]
-T_ACC  = best["T_MINOR_ACCEPT"]
+    m = summarize_multiclass_metrics(y_va, va_pred)
+    cascade_fold_metrics.append(m)
+    print("Fold metrics:", {k: round(v, 4) for k, v in m.items()})
+    print("Fold minority rate (VAL):", round(float((y_va != majority_class).mean()), 6))
 
-y_test_pred = run_cascade_predict(
-    y_majority_label=majority_class,
-    gate_probs=gate_test_prob,
-    minority_clf=minority_model,
-    X=X_test_s,
-    T_GATE=T_GATE,
-    T_ACCEPT=T_ACC,
-    minority_labels=minority_labels
+print_mean_std(
+    cascade_fold_metrics,
+    keys=["acc", "bal_acc", "f1_macro", "f1_weighted"],
+    title="Cascade: mean ± std across 5 folds"
 )
 
-print("T_GATE =", T_GATE, "T_MINOR_ACCEPT =", T_ACC)
-print(f"Predicted minority rate on TEST: {float((y_test_pred != majority_class).mean())*100:.2f}%")
+all_labels = [majority_class] + [lab for lab in sorted(np.unique(y).tolist()) if lab != majority_class]
 
-report = classification_report(y_test, y_test_pred, zero_division=0)
-print(report)
+print("\n========== Full Cascade POOLED OOF Report (5 folds) ==========")
+print(f"Gate threshold (fixed) = {GATE_THRESHOLD:.3f}")
+print(f"Minor accept threshold (fixed) = {MIN_ACCEPT_THRESHOLD:.3f}")
+print(classification_report(y, oof_cascade_pred, labels=all_labels, zero_division=0))
 
-minority_macro = safe_f1_macro_minority(y_test, y_test_pred, minority_labels)
-print("\nMinority macro-F1 on TEST (over selected minority labels):", float(minority_macro))
+# ---- ADD YOUR METRIC HERE (cascade predictions, over SELECTED minority labels) ----
+minority_macro_f1_cascade = safe_macro_f1_on_labels(
+    y_true=y,
+    y_pred=oof_cascade_pred,
+    labels=topk_minority
+)
+print("\nMinority macro-F1 on OOF (FULL CASCADE, over selected minority labels):",
+      minority_macro_f1_cascade)
 
-# ----------------------------
-# Save report (optional)
-# ----------------------------
-if SAVE_TO_DRIVE:
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    report_path = os.path.join(OUTPUT_DIR, REPORT_NAME)
-    thresh_path = os.path.join(OUTPUT_DIR, THRESH_NAME)
+# -----------------------------
+# Optional: save outputs
+# -----------------------------
+out_dir = "/content/Cascade_CV_AveragedMetrics_RF"
+os.makedirs(out_dir, exist_ok=True)
 
-    with open(report_path, "w") as f:
-        f.write("=== Best thresholds (selected on VAL) ===\n")
-        f.write(json.dumps(best, indent=2))
-        f.write("\n\n=== TEST Classification Report ===\n")
-        f.write(report)
-        f.write(f"\nMinority macro-F1 on TEST: {minority_macro}\n")
+with open(os.path.join(out_dir, "gate_5fold_non_strat_meanstd_and_oof.txt"), "w") as f:
+    f.write(f"Gate threshold (fixed): {GATE_THRESHOLD:.4f}\n")
+    f.write("Gate folds (KFold, non-stratified): %d\n\n" % GATE_FOLDS)
+    for i, m in enumerate(gate_fold_metrics, start=1):
+        f.write(f"Fold {i}: {m}\n")
+    f.write("\nPOOLED OOF REPORT:\n")
+    f.write(classification_report(y_gate, oof_gate_pred, zero_division=0))
 
-    with open(thresh_path, "w") as f:
-        json.dump(best, f, indent=2)
+with open(os.path.join(out_dir, "minority_rf_repeated3fold_meanstd_and_oof.txt"), "w") as f:
+    f.write(f"RepeatedStratifiedKFold: n_splits={RF_RS_FOLDS}, n_repeats={RF_RS_REPEATS}\n\n")
+    for i, m in enumerate(rf_split_metrics, start=1):
+        f.write(f"Split {i}: {m}\n")
+    f.write("\nMEAN±STD (computed in notebook output)\n")
+    f.write("\nPOOLED OOF REPORT (probability-averaged):\n")
+    f.write(classification_report(y_min, oof_rf_pred_min, zero_division=0))
+    f.write("\n\nMinority macro-F1 on OOF (minority RF stage, selected labels): "
+            f"{minority_macro_f1_minority_stage:.10f}\n")
 
-    print("\nSaved report to:", report_path)
-    print("Saved thresholds to:", thresh_path)
+with open(os.path.join(out_dir, "cascade_5fold_non_strat_meanstd_and_oof.txt"), "w") as f:
+    f.write(f"Gate threshold (fixed): {GATE_THRESHOLD:.4f}\n")
+    f.write(f"Minor accept threshold (fixed): {MIN_ACCEPT_THRESHOLD:.4f}\n")
+    f.write("Cascade folds (KFold, non-stratified): %d\n\n" % GATE_FOLDS)
+    for i, m in enumerate(cascade_fold_metrics, start=1):
+        f.write(f"Fold {i}: {m}\n")
+    f.write("\nPOOLED OOF REPORT:\n")
+    f.write(classification_report(y, oof_cascade_pred, labels=all_labels, zero_division=0))
+    f.write("\n\nMinority macro-F1 on OOF (FULL CASCADE, selected labels): "
+            f"{minority_macro_f1_cascade:.10f}\n")
 
-print("\nDone.")
+print(f"\nSaved averaged-metric outputs to: {out_dir}")
+print("Done.")
