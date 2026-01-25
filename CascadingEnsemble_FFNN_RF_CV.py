@@ -1,16 +1,26 @@
 # ============================================================
-# Cascade WITH CV (RF version) + Minority macro-F1 metric (selected minority labels)
+# IMPROVED Cascade WITH CV (RF version)
 #
-# Adds:
-#   minority_macro_f1 = safe_macro_f1_on_labels(y_true, y_pred, labels=topk_minority)
-# and prints it for:
-#   - Minority RF pooled OOF (minority-only stage)
-#   - Full Cascade pooled OOF (all samples)
+# Key improvements vs your current script:
+#  1) NO scaling for Random Forest (RF) stages (RF doesn't need StandardScaler)
+#  2) Balance the MINORITY stage *within each split* using RandomOverSampler
+#     (safer than SMOTE for BRFSS-style discrete features)
+#  3) Stronger RF settings for macro-F1 on imbalanced multiclass:
+#       - capped max_depth
+#       - larger min_samples_leaf / min_samples_split
+#       - more trees
+#       - explicit class_weight dict (stronger than balanced_subsample)
+#
+# Keeps:
+#  - Gate NN: 5-fold NON-STRATIFIED CV (as you had)
+#  - Minority stage: RepeatedStratifiedKFold (3-fold x repeats)
+#  - Full cascade OOF using same 5 gate folds
+#  - Prints and saves the same style outputs including:
+#       minority macro-F1 over SELECTED minority labels
 #
 # Notes:
-# - "TEST" in your earlier printouts = the held-out set.
-#   Here we’re doing OOF across CV, so it’s "OOF".
-#   (Same idea: unbiased predictions for every sample.)
+#  - Gate NN STILL uses scaling (good practice for NN)
+#  - RF stages use raw X (no scaling)
 # ============================================================
 
 import os
@@ -28,6 +38,8 @@ from sklearn.metrics import (
     f1_score,
 )
 from sklearn.ensemble import RandomForestClassifier
+
+from imblearn.over_sampling import RandomOverSampler
 
 import tensorflow as tf
 from tensorflow.keras import Sequential
@@ -53,11 +65,11 @@ GATE_BATCH = 256
 GATE_LR = 1e-3
 GATE_PATIENCE = 6
 
-# Random Forest hyperparams (tweak as you like)
-RF_N_ESTIMATORS = 400
-RF_MAX_DEPTH = None
-RF_MIN_SAMPLES_LEAF = 1
-RF_MIN_SAMPLES_SPLIT = 2
+# RF hyperparams (tuned-ish for macro-F1 on imbalanced multiclass)
+RF_N_ESTIMATORS = 800
+RF_MAX_DEPTH = 30
+RF_MIN_SAMPLES_LEAF = 5
+RF_MIN_SAMPLES_SPLIT = 10
 RF_MAX_FEATURES = "sqrt"
 RF_N_JOBS = -1
 
@@ -69,12 +81,12 @@ MIN_ACCEPT_THRESHOLD = 0.00    # accept RF prediction if RF max-proba >= this (0
 GATE_FOLDS = 5
 
 RF_RS_FOLDS = 3
-RF_RS_REPEATS = 5  # set higher for stabler averages
+RF_RS_REPEATS = 5  # increase for stability
 
 # -----------------------------
 # Load data
 # -----------------------------
-CSV_PATH = "/content/LLCP2017_2018_2019_2020_2021XPT_LINEAR_WHOICD_5YEAR.csv"
+CSV_PATH = "/content/LLCP_SMOKE_5YEAR.csv"
 
 if not os.path.exists(CSV_PATH):
     raise FileNotFoundError(
@@ -162,7 +174,15 @@ def build_gate_model(input_dim: int) -> tf.keras.Model:
     )
     return model
 
-def make_rf() -> RandomForestClassifier:
+def make_rf_with_weights(y_train: np.ndarray) -> RandomForestClassifier:
+    """
+    Stronger than balanced_subsample: explicit weights computed on the
+    (possibly resampled) training labels.
+    """
+    classes = np.unique(y_train)
+    w = compute_class_weight(class_weight="balanced", classes=classes, y=y_train)
+    cw = {int(c): float(wi) for c, wi in zip(classes, w)}
+
     return RandomForestClassifier(
         n_estimators=RF_N_ESTIMATORS,
         random_state=SEED,
@@ -171,7 +191,8 @@ def make_rf() -> RandomForestClassifier:
         min_samples_leaf=RF_MIN_SAMPLES_LEAF,
         min_samples_split=RF_MIN_SAMPLES_SPLIT,
         max_features=RF_MAX_FEATURES,
-        class_weight="balanced_subsample",
+        class_weight=cw,
+        bootstrap=True,
     )
 
 def summarize_binary_metrics(y_true, y_pred):
@@ -200,12 +221,6 @@ def print_mean_std(metrics_list, keys, title):
         print(f"  {k:>10s}: {mu:.4f} ± {sd:.4f}")
 
 def safe_macro_f1_on_labels(y_true, y_pred, labels):
-    """
-    Macro-F1 computed ONLY over the provided labels.
-    - If a label has 0 support in y_true, sklearn can behave oddly for per-label
-      averages; we explicitly filter to labels that appear in y_true.
-    - If none appear, return 0.0.
-    """
     labels = [int(l) for l in labels]
     present = sorted(set(int(x) for x in np.unique(y_true)).intersection(labels))
     if len(present) == 0:
@@ -285,8 +300,7 @@ for fold, (tr_idx, va_idx) in enumerate(kf_gate.split(X), start=1):
 
     m = summarize_binary_metrics(yg_va, pred)
     gate_fold_metrics.append(m)
-    print("Fold metrics:", {k: round(v, 4) for k, v in m.items()})
-    print("Fold minority rate (VAL):", round(float(yg_va.mean()), 6))
+    print("Fold metrics:", {k: round(float(v), 4) for k, v in m.items()})
 
 print_mean_std(
     gate_fold_metrics,
@@ -299,10 +313,10 @@ print("Gate threshold:", GATE_THRESHOLD)
 print(classification_report(y_gate, oof_gate_pred, zero_division=0))
 
 # ============================================================
-# (2) Minority RF: RepeatedStratified 3-fold CV
+# (2) Minority RF: RepeatedStratified 3-fold CV + Oversampling
 # ============================================================
 print("\n============================================================")
-print("========== (2) Minority RF: RepeatedStratified 3-FOLD CV (Averaged) ==========")
+print("========== (2) Minority RF: RepeatedStratified 3-FOLD CV + Oversampling ==========")
 print("============================================================")
 
 minor_mask = (y != majority_class)
@@ -331,16 +345,18 @@ for split_i, (tr_idx, va_idx) in enumerate(rskf_rf.split(X_min, y_min), start=1)
     X_tr, X_va = X_min[tr_idx], X_min[va_idx]
     y_tr, y_va = y_min[tr_idx], y_min[va_idx]
 
-    scaler = StandardScaler()
-    X_tr_s = scaler.fit_transform(X_tr)
-    X_va_s = scaler.transform(X_va)
+    # --- Oversample TRAIN split (balances the 20 minority classes) ---
+    ros = RandomOverSampler(random_state=SEED)
+    X_tr_bal, y_tr_bal = ros.fit_resample(X_tr, y_tr)
 
-    rf = make_rf()
-    rf.fit(X_tr_s, y_tr)
+    # --- Train RF (NO scaling) ---
+    rf = make_rf_with_weights(y_tr_bal)
+    rf.fit(X_tr_bal, y_tr_bal)
 
     rf_classes = rf.classes_
-    rf_proba = rf.predict_proba(X_va_s)
+    rf_proba = rf.predict_proba(X_va)
 
+    # map to fixed label order for averaging
     mapped = np.zeros((len(va_idx), len(minority_labels)), dtype=np.float64)
     for j, c in enumerate(rf_classes):
         mapped[:, lab_to_idx[int(c)]] = rf_proba[:, j]
@@ -358,7 +374,7 @@ for split_i, (tr_idx, va_idx) in enumerate(rskf_rf.split(X_min, y_min), start=1)
 print_mean_std(
     rf_split_metrics,
     keys=["acc", "bal_acc", "f1_macro", "f1_weighted"],
-    title=f"Minority RF: mean ± std across {total_splits} splits (repeated {RF_RS_FOLDS}-fold)"
+    title=f"Minority RF: mean ± std across {total_splits} splits (RepeatedStratified {RF_RS_FOLDS}-fold)"
 )
 
 avg_proba = proba_sum / np.maximum(proba_cnt[:, None], 1)
@@ -367,7 +383,6 @@ oof_rf_pred_min = np.array(minority_labels, dtype=int)[np.argmax(avg_proba, axis
 print("\n========== Minority RF POOLED OOF Report (probability-averaged) ==========")
 print(classification_report(y_min, oof_rf_pred_min, zero_division=0))
 
-# ---- ADD YOUR METRIC HERE (minority macro-F1 over SELECTED minority labels) ----
 minority_macro_f1_minority_stage = safe_macro_f1_on_labels(
     y_true=y_min,
     y_pred=oof_rf_pred_min,
@@ -377,10 +392,11 @@ print("\nMinority macro-F1 on OOF (minority RF stage, over selected minority lab
       minority_macro_f1_minority_stage)
 
 # ============================================================
-# (3) BONUS: Full cascade OOF using SAME 5 gate folds (non-stratified)
+# (3) Full cascade OOF using SAME 5 gate folds (non-stratified)
+#     + oversampling in the minority RF per fold
 # ============================================================
 print("\n============================================================")
-print("========== (3) BONUS: Full Cascade OOF (5 folds, averaged) ==========")
+print("========== (3) Full Cascade OOF (5 folds) + Oversampling ==========")
 print("============================================================")
 
 oof_cascade_pred = np.full(len(y), majority_class, dtype=int)
@@ -393,11 +409,11 @@ for fold, (tr_idx, va_idx) in enumerate(kf_gate.split(X), start=1):
     y_tr, y_va = y[tr_idx], y[va_idx]
     yg_tr, yg_va = y_gate[tr_idx], y_gate[va_idx]
 
+    # ---- Train Gate (WITH scaling) ----
     scaler = StandardScaler()
     X_tr_s = scaler.fit_transform(X_tr)
     X_va_s = scaler.transform(X_va)
 
-    # ---- Train Gate ----
     gate_classes = np.unique(yg_tr)
     gate_cw = compute_class_weight(class_weight="balanced", classes=gate_classes, y=yg_tr)
     gate_cw_dict = {int(c): float(w) for c, w in zip(gate_classes, gate_cw)}
@@ -417,10 +433,10 @@ for fold, (tr_idx, va_idx) in enumerate(kf_gate.split(X), start=1):
 
     va_gate_probs = gate.predict(X_va_s, verbose=0).ravel()
 
-    # ---- Train RF on TRUE minority TRAIN samples only ----
+    # ---- Train RF on TRUE minority TRAIN samples only (NO scaling) ----
     min_tr_mask = (y_tr != majority_class)
-    X_tr_min_s = X_tr_s[min_tr_mask]
-    y_tr_min   = y_tr[min_tr_mask]
+    X_tr_min = X_tr[min_tr_mask]
+    y_tr_min = y_tr[min_tr_mask]
 
     if len(np.unique(y_tr_min)) < 2:
         print("WARNING: Not enough minority variety in this fold. Defaulting to majority.")
@@ -429,11 +445,15 @@ for fold, (tr_idx, va_idx) in enumerate(kf_gate.split(X), start=1):
         cascade_fold_metrics.append(summarize_multiclass_metrics(y_va, va_pred))
         continue
 
-    rf = make_rf()
-    rf.fit(X_tr_min_s, y_tr_min)
+    # Oversample minority TRAIN fold
+    ros = RandomOverSampler(random_state=SEED)
+    X_tr_min_bal, y_tr_min_bal = ros.fit_resample(X_tr_min, y_tr_min)
+
+    rf = make_rf_with_weights(y_tr_min_bal)
+    rf.fit(X_tr_min_bal, y_tr_min_bal)
 
     rf_classes = rf.classes_
-    rf_proba_va = rf.predict_proba(X_va_s)
+    rf_proba_va = rf.predict_proba(X_va)  # NOTE: raw X_va (no scaling)
 
     va_pred = cascade_predict_from_probs(
         y_true=y_va,
@@ -449,7 +469,7 @@ for fold, (tr_idx, va_idx) in enumerate(kf_gate.split(X), start=1):
 
     m = summarize_multiclass_metrics(y_va, va_pred)
     cascade_fold_metrics.append(m)
-    print("Fold metrics:", {k: round(v, 4) for k, v in m.items()})
+    print("Fold metrics:", {k: round(float(v), 4) for k, v in m.items()})
     print("Fold minority rate (VAL):", round(float((y_va != majority_class).mean()), 6))
 
 print_mean_std(
@@ -465,7 +485,6 @@ print(f"Gate threshold (fixed) = {GATE_THRESHOLD:.3f}")
 print(f"Minor accept threshold (fixed) = {MIN_ACCEPT_THRESHOLD:.3f}")
 print(classification_report(y, oof_cascade_pred, labels=all_labels, zero_division=0))
 
-# ---- ADD YOUR METRIC HERE (cascade predictions, over SELECTED minority labels) ----
 minority_macro_f1_cascade = safe_macro_f1_on_labels(
     y_true=y,
     y_pred=oof_cascade_pred,
@@ -475,9 +494,9 @@ print("\nMinority macro-F1 on OOF (FULL CASCADE, over selected minority labels):
       minority_macro_f1_cascade)
 
 # -----------------------------
-# Optional: save outputs
+# Save outputs
 # -----------------------------
-out_dir = "/content/Cascade_CV_AveragedMetrics_RF"
+out_dir = "/content/Cascade_CV_AveragedMetrics_RF_IMPROVED"
 os.makedirs(out_dir, exist_ok=True)
 
 with open(os.path.join(out_dir, "gate_5fold_non_strat_meanstd_and_oof.txt"), "w") as f:
@@ -489,10 +508,13 @@ with open(os.path.join(out_dir, "gate_5fold_non_strat_meanstd_and_oof.txt"), "w"
     f.write(classification_report(y_gate, oof_gate_pred, zero_division=0))
 
 with open(os.path.join(out_dir, "minority_rf_repeated3fold_meanstd_and_oof.txt"), "w") as f:
-    f.write(f"RepeatedStratifiedKFold: n_splits={RF_RS_FOLDS}, n_repeats={RF_RS_REPEATS}\n\n")
+    f.write(f"RepeatedStratifiedKFold: n_splits={RF_RS_FOLDS}, n_repeats={RF_RS_REPEATS}\n")
+    f.write("Oversampling: RandomOverSampler on each TRAIN split\n")
+    f.write(f"RF params: n_estimators={RF_N_ESTIMATORS}, max_depth={RF_MAX_DEPTH}, "
+            f"min_samples_leaf={RF_MIN_SAMPLES_LEAF}, min_samples_split={RF_MIN_SAMPLES_SPLIT}, "
+            f"max_features={RF_MAX_FEATURES}\n\n")
     for i, m in enumerate(rf_split_metrics, start=1):
         f.write(f"Split {i}: {m}\n")
-    f.write("\nMEAN±STD (computed in notebook output)\n")
     f.write("\nPOOLED OOF REPORT (probability-averaged):\n")
     f.write(classification_report(y_min, oof_rf_pred_min, zero_division=0))
     f.write("\n\nMinority macro-F1 on OOF (minority RF stage, selected labels): "
@@ -501,7 +523,11 @@ with open(os.path.join(out_dir, "minority_rf_repeated3fold_meanstd_and_oof.txt")
 with open(os.path.join(out_dir, "cascade_5fold_non_strat_meanstd_and_oof.txt"), "w") as f:
     f.write(f"Gate threshold (fixed): {GATE_THRESHOLD:.4f}\n")
     f.write(f"Minor accept threshold (fixed): {MIN_ACCEPT_THRESHOLD:.4f}\n")
-    f.write("Cascade folds (KFold, non-stratified): %d\n\n" % GATE_FOLDS)
+    f.write("Cascade folds (KFold, non-stratified): %d\n" % GATE_FOLDS)
+    f.write("Oversampling: RandomOverSampler on minority TRAIN per fold\n")
+    f.write(f"RF params: n_estimators={RF_N_ESTIMATORS}, max_depth={RF_MAX_DEPTH}, "
+            f"min_samples_leaf={RF_MIN_SAMPLES_LEAF}, min_samples_split={RF_MIN_SAMPLES_SPLIT}, "
+            f"max_features={RF_MAX_FEATURES}\n\n")
     for i, m in enumerate(cascade_fold_metrics, start=1):
         f.write(f"Fold {i}: {m}\n")
     f.write("\nPOOLED OOF REPORT:\n")
@@ -509,5 +535,5 @@ with open(os.path.join(out_dir, "cascade_5fold_non_strat_meanstd_and_oof.txt"), 
     f.write("\n\nMinority macro-F1 on OOF (FULL CASCADE, selected labels): "
             f"{minority_macro_f1_cascade:.10f}\n")
 
-print(f"\nSaved averaged-metric outputs to: {out_dir}")
+print(f"\nSaved improved outputs to: {out_dir}")
 print("Done.")
